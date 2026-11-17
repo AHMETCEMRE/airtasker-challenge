@@ -10,7 +10,12 @@ test-paths: ["tests"]
 
 seeds:
   airtasker_challenge:
-    +schema: raw
+    # Scoped to raw_locations rather than applied to every seed: it stands in
+    # for a source table the warehouse would normally load, so it belongs in
+    # raw. category_weather_exposure is business configuration, not source
+    # data, so it lands in the default schema alongside the models.
+    raw_locations:
+      +schema: raw
 
 models:
   airtasker_challenge:
