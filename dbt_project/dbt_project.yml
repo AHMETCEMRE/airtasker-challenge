@@ -25,3 +25,20 @@ models:
       +materialized: view
     mart:
       +materialized: table
+
+vars:
+  # Risk label boundaries, inclusive at the lower edge. Product tunes these
+  # after launch, so they are configuration rather than code. Both marts read
+  # the label through the weather_risk_label macro, so a change here can never
+  # desynchronise Product's per-task warnings from Operations' daily counts.
+  risk_threshold_medium: 30
+  risk_threshold_high: 60
+
+  # How long a job is assumed to occupy, starting at scheduled_at. A task is
+  # scored against the worst weather in this window rather than a single hour.
+  risk_window_hours: 3
+
+  # "Now" for the eligibility filter. Defaults to the dbt run's start time;
+  # override it to reproduce a past run, e.g.
+  #   dbt build --vars '{risk_as_of_utc: "2026-11-20 00:00:00"}'
+  risk_as_of_utc: ""
