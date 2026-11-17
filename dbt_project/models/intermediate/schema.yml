@@ -1,6 +1,589 @@
 version: 2
 
-models: []
+models:
+  - name: int_tasks_upcoming
+    description: >
+      One row per task with upcoming scheduled work. Owns eligibility (which
+      tasks the CRM should consider) and localisation (which local day and hour
+      the work falls on). Deliberately does not score: keeping the clock here
+      and the arithmetic in int_task_weather_risk is what makes the risk logic
+      unit-testable without a dependency on when the test runs.
+    columns:
+      - name: task_id
+        description: Unique per row - this model is one row per eligible task.
+        data_tests:
+          - unique
+          - not_null
 
+      - name: category
+        description: Canonical display name from the exposure seed.
+        data_tests:
+          - not_null
+
+      - name: exposure_weight
+        description: >
+          Hazard multiplier for the category. NULL would mean a category that
+          did not match the seed, which the staging relationships test already
+          fails the build on.
+        data_tests:
+          - not_null
+
+      - name: state
+        description: Always 'assigned' here, by construction of the filter.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['assigned']
+
+      - name: scheduled_at_utc
+        description: When the work starts, UTC.
+        data_tests:
+          - not_null
+
+      - name: scheduled_hour_utc
+        description: >
+          scheduled_at_utc truncated to the hour, which is the join key onto
+          the hourly forecast grid.
+        data_tests:
+          - not_null
+
+      - name: scheduled_local_date
+        description: >
+          The local calendar day the work falls on, converted through the
+          location's IANA timezone. This is the grain Operations' mart is cut
+          on. NULL only for a task whose location is missing from the seed.
+
+      - name: location_id
+        description: >
+          FK to stg_locations, left-joined. Orphans survive here on purpose so
+          they reach Product's mart as 'unknown' rather than disappearing.
+
+  - name: int_weather_window
+    description: >
+      One row per (location_id, window_start_utc): the weather a job starting
+      at that hour would actually experience, aggregated over
+      var('risk_window_hours'). Built for every forecast hour rather than only
+      hours with tasks, so it stays independent of task-side business rules.
+    columns:
+      - name: location_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+
+      - name: window_start_utc
+        description: First hour of the window; the join key for a scheduled task.
+        data_tests:
+          - not_null
+
+      - name: precip_probability_max
+        description: Highest hourly probability of precipitation across the window, percent.
+
+      - name: precip_mm_sum
+        description: Total precipitation across the window, millimetres.
+
+      - name: wind_gusts_kmh_max
+        description: Strongest gust across the window, km/h. The wind input to the score.
+
+      - name: temperature_min_c
+        description: Coldest hour in the window, celsius.
+
+      - name: temperature_max_c
+        description: Warmest hour in the window, celsius.
+
+      - name: weather_code_modal
+        description: Most frequent WMO code across the window, for Operations' summary.
+
+      - name: forecast_hours_covered
+        description: >
+          How many forecast hours the window actually contains. Below
+          risk_window_hours means the window runs off the end of the horizon.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: 1
+                max_value: 3
+
+    data_tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns:
+              - location_id
+              - window_start_utc
+
+  - name: int_task_weather_risk
+    description: >
+      One row per upcoming scheduled task, with its weather risk score and
+      label. The only model that scores. Both marts derive from this one, which
+      is what makes Product's per-task warnings and Operations' daily high-risk
+      counts consistent by construction rather than by convention.
+
+      Every sub-score guards its inputs for NULL explicitly, because DuckDB's
+      greatest() and least() ignore nulls rather than propagating them: a naive
+      formulation scores missing precipitation data as a certainty of rain and
+      missing wind data as dead calm.
+    columns:
+      - name: task_id
+        data_tests:
+          - unique
+          - not_null
+
+      - name: precip_score
+        description: >
+          Precipitation hazard, 0-100. NULL when neither probability nor
+          intensity was available for the window.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: wind_score
+        description: Gust hazard, 0-100. NULL when no gust data covered the window.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: temp_score
+        description: >
+          Temperature hazard, 0-100, scored from both the hot and cold ends and
+          taking the worse. NULL when no temperature data covered the window.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: hazard_score
+        description: >
+          The worst of the three sub-scores. NULL only when all three are NULL,
+          which is exactly the condition that produces an 'unknown' label.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: weather_risk_score
+        description: >
+          hazard_score scaled by the category's exposure weight, 0-100.
+          Deterministically 0 for categories with no weather exposure, even
+          with no forecast. NULL when there is no usable forecast.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: weather_risk_label
+        description: >
+          low / medium / high from the score, or 'unknown' when the score is
+          NULL. Produced by the weather_risk_label macro so the mapping exists
+          once; thresholds come from vars.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['low', 'medium', 'high', 'unknown']
+
+      - name: has_forecast
+        description: Whether a forecast window matched this task's scheduled hour.
+        data_tests:
+          - not_null
+
+  - name: int_location_days
+    description: >
+      One row per location per local day: the calendar spine Operations' mart
+      is built on, with each day's weather aggregated between local midnights.
+
+      The spine comes from stg_locations rather than from the forecast table.
+      Perth has no forecast rows at all, so a weather-derived spine would drop
+      it entirely and hide the 7 scheduled tasks nobody can forecast - exactly
+      the rows Operations most needs to see.
+    columns:
+      - name: location_id
+        description: FK to stg_locations. Every location appears, with or without weather.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+
+      - name: local_date
+        description: Calendar day in the location's own timezone.
+        data_tests:
+          - not_null
+
+      - name: forecast_hours
+        description: >
+          Forecast hours available for this local day, 0 to 24. Zero means no
+          weather at all (Perth). The first and last local day of the horizon
+          are legitimately partial, because a 16-day UTC window does not start
+          or end at local midnight.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 24
+
+      - name: is_complete_local_day
+        description: >
+          True only for days with all 24 hours. Lets a consumer tell a mild day
+          from a half-observed one.
+        data_tests:
+          - not_null
+
+      - name: weather_description
+        description: >
+          The day's typical weather, from the modal WMO code. NULL where there
+          is no forecast.
+
+      - name: weather_description_worst
+        description: >
+          The worst condition the day reaches, from the maximum WMO code. Kept
+          alongside the modal one because the mode alone understates a day with
+          scattered rain among a plurality of clear hours.
+
+      - name: temperature_min_c
+        description: Coldest hour of the local day, celsius.
+
+      - name: temperature_max_c
+        description: Warmest hour of the local day, celsius.
+
+    data_tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns:
+              - location_id
+              - local_date
+
+# ---------------------------------------------------------------------------
+# Unit tests for the scoring logic.
+#
+# These run on fixtures, not on warehouse data, so they assert exact numbers
+# and cannot drift as the forecast changes. int_task_weather_risk takes no
+# clock and no configuration beyond the exposure weight it is handed, which is
+# precisely what makes that possible - the eligibility filter and its
+# dependency on "now" live upstream in int_tasks_upcoming.
+#
+# They target the places the logic can actually go wrong rather than the happy
+# path: the null traps, the hazard combination rule, the exposure branches, and
+# the label boundary.
+# ---------------------------------------------------------------------------
 unit_tests:
-  []
+
+  - name: worst_hazard_wins_rather_than_the_average
+    description: >
+      Risk is a disjunction: one severe hazard is enough to stop the job. A dry,
+      mild day with 60 km/h gusts must score 100, not the 37 a mean of the three
+      sub-scores would give. This is the test that fails if anyone "improves"
+      the model by averaging.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_ROOF
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 10
+            precip_mm_sum: 0.0
+            wind_gusts_kmh_max: 60.0
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_ROOF
+            precip_score: 10.0
+            wind_score: 100.0
+            temp_score: 0.0
+            hazard_score: 100.0
+            weather_risk_score: 100
+            weather_risk_label: high
+
+  - name: precipitation_scores_on_intensity_as_well_as_probability
+    description: >
+      4mm over the working window saturates the intensity term even when the
+      probability is low, because "only a 20% chance, but if it happens you get
+      4mm" is still a ruined roof clean. Also pins the wind floor: 10 km/h is
+      below the 20 km/h threshold and must clamp to 0, not go negative.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_PAINT
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 20
+            precip_mm_sum: 4.0
+            wind_gusts_kmh_max: 10.0
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_PAINT
+            precip_score: 100.0
+            wind_score: 0.0
+            hazard_score: 100.0
+            weather_risk_score: 100
+            weather_risk_label: high
+
+  - name: missing_precipitation_data_is_not_certain_rain
+    description: >
+      THE null trap. DuckDB's least() ignores nulls, so the natural expression
+      least(100, precip_mm_sum * 25) returns 100 when precip_mm_sum is NULL -
+      scoring "we have no rain data" as "4mm guaranteed".
+
+      With precipitation unknown and gusts at 40 km/h, the answer must be 50
+      (wind-driven) with a NULL precip_score. If the guard is ever removed this
+      test sees 100 and 'high' instead.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_NO_RAIN_DATA
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: null
+            precip_mm_sum: null
+            wind_gusts_kmh_max: 40.0
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_NO_RAIN_DATA
+            precip_score: null
+            wind_score: 50.0
+            temp_score: 0.0
+            hazard_score: 50.0
+            weather_risk_score: 50
+            weather_risk_label: medium
+
+  - name: missing_wind_data_is_not_dead_calm
+    description: >
+      The mirror image. greatest(0, NULL) returns 0 in DuckDB, so an unguarded
+      wind term reports "no gusts" when it means "no gust data" - understating
+      risk rather than overstating it, which is the more dangerous direction for
+      a safety warning. wind_score must be NULL, and the known rain must drive
+      the score.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_NO_WIND_DATA
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 35
+            precip_mm_sum: 0.0
+            wind_gusts_kmh_max: null
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_NO_WIND_DATA
+            precip_score: 35.0
+            wind_score: null
+            hazard_score: 35.0
+            weather_risk_score: 35
+            weather_risk_label: medium
+
+  - name: partial_weather_uses_the_worst_of_what_is_known
+    description: >
+      A deliberate, tested decision rather than an accident of null handling.
+      With only temperature available and it reading -10C, the pipeline still
+      warns: a frozen morning is a frozen morning whether or not we also know
+      the wind.
+
+      The documented cost of this choice is the converse case - if the only
+      known variable happens to be a mild temperature, the task scores low even
+      though rain is unknown. Recorded in DECISIONS.md. In practice Open-Meteo
+      returns these variables together, so no real task has hit it.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_FREEZING
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: null
+            precip_mm_sum: null
+            wind_gusts_kmh_max: null
+            temperature_min_c: -10.0
+            temperature_max_c: 0.0
+    expect:
+      rows:
+          - task_id: TASK_FREEZING
+            precip_score: null
+            wind_score: null
+            temp_score: 100.0
+            hazard_score: 100.0
+            weather_risk_score: 100
+            weather_risk_label: high
+
+  - name: no_forecast_is_unknown_unless_the_work_is_indoors
+    description: >
+      Two tasks at a location with no forecast window at all - the Perth and
+      orphaned-location case.
+
+      The outdoor one must be NULL / 'unknown'. Explicitly not 'low': missing
+      data is not safe data, and labelling it low would suppress a warning the
+      pipeline cannot justify.
+
+      The desk-work one must still be 0 / 'low', because zero weather
+      sensitivity is a fact about the category and not a gap in the data. This
+      is why the exposure_weight = 0 branch is evaluated BEFORE the hazard null
+      check; reorder them and online tutoring sessions start polluting
+      Operations' unknown counts. T056 is the real row this protects.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_OUTDOOR_NO_DATA
+            location_id: LOC_NO_FORECAST
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+          - task_id: TASK_DESK_NO_DATA
+            location_id: LOC_NO_FORECAST
+            exposure_weight: 0.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_SOMEWHERE_ELSE
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 90
+            precip_mm_sum: 10.0
+            wind_gusts_kmh_max: 80.0
+            temperature_min_c: 2.0
+            temperature_max_c: 4.0
+    expect:
+      rows:
+          - task_id: TASK_OUTDOOR_NO_DATA
+            hazard_score: null
+            weather_risk_score: null
+            weather_risk_label: unknown
+            has_forecast: false
+          - task_id: TASK_DESK_NO_DATA
+            hazard_score: null
+            weather_risk_score: 0
+            weather_risk_label: low
+            has_forecast: false
+
+  - name: exposure_weight_scales_the_hazard
+    description: >
+      Identical weather, three categories. The same 100-point hazard becomes
+      high for fully exposed work, high for mixed work, and low for work that
+      only needs access - which is the whole reason exposure is a multiplier
+      rather than a filter.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_FULLY_EXPOSED
+            location_id: LOC_1
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+          - task_id: TASK_MIXED
+            location_id: LOC_1
+            exposure_weight: 0.6
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+          - task_id: TASK_INCIDENTAL
+            location_id: LOC_1
+            exposure_weight: 0.2
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_1
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 100
+            precip_mm_sum: 5.0
+            wind_gusts_kmh_max: 15.0
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_FULLY_EXPOSED
+            weather_risk_score: 100
+            weather_risk_label: high
+          - task_id: TASK_MIXED
+            weather_risk_score: 60
+            weather_risk_label: high
+          - task_id: TASK_INCIDENTAL
+            weather_risk_score: 20
+            weather_risk_label: low
+
+  - name: label_boundaries_are_inclusive_at_the_lower_edge
+    description: >
+      Pins the high threshold from both sides, so a change to risk_threshold_high
+      cannot silently move the boundary by one point. Gusts of 44.0 km/h give a
+      hazard of exactly 60 and must be 'high'; 43.6 km/h gives 59 and must be
+      'medium'. T088 lands on exactly 60 in the real data, so this is not a
+      hypothetical edge.
+    model: int_task_weather_risk
+    given:
+      - input: ref('int_tasks_upcoming')
+        rows:
+          - task_id: TASK_EXACTLY_60
+            location_id: LOC_60
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+          - task_id: TASK_EXACTLY_59
+            location_id: LOC_59
+            exposure_weight: 1.0
+            scheduled_hour_utc: "2026-11-20 09:00:00"
+      - input: ref('int_weather_window')
+        rows:
+          - location_id: LOC_60
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 0
+            precip_mm_sum: 0.0
+            wind_gusts_kmh_max: 44.0
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+          - location_id: LOC_59
+            window_start_utc: "2026-11-20 09:00:00"
+            precip_probability_max: 0
+            precip_mm_sum: 0.0
+            wind_gusts_kmh_max: 43.6
+            temperature_min_c: 18.0
+            temperature_max_c: 22.0
+    expect:
+      rows:
+          - task_id: TASK_EXACTLY_60
+            hazard_score: 60.0
+            weather_risk_score: 60
+            weather_risk_label: high
+          - task_id: TASK_EXACTLY_59
+            hazard_score: 59.0
+            weather_risk_score: 59
+            weather_risk_label: medium

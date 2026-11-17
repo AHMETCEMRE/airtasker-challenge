@@ -10,3 +10,48 @@ seeds:
         lat: varchar
         lng: varchar
         timezone: varchar
+
+  - name: category_weather_exposure
+    description: >
+      How exposed each task category is to the weather, as a multiplier on the
+      hazard score. Held as a seed rather than in SQL so Product can tune the
+      weights in a CSV without a code change, and so the mapping is reviewable
+      in a diff.
+
+      exposure_weight scales the worst hazard: 1.0 means the weather decides
+      whether the job happens at all, 0.0 means it is irrelevant. Any category
+      present in stg_tasks but missing here is caught by a relationships test
+      rather than silently scoring as unmatched.
+    config:
+      column_types:
+        category_key: varchar
+        category: varchar
+        exposure_class: varchar
+        exposure_weight: double
+        rationale: varchar
+    columns:
+      - name: category_key
+        description: Lowercased category name; the join key against stg_tasks.category_key.
+        data_tests:
+          - unique
+          - not_null
+      - name: category
+        description: Canonical display name, used in the marts.
+        data_tests:
+          - not_null
+      - name: exposure_class
+        description: Human-readable band the weight belongs to.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['fully_exposed', 'mixed', 'incidental', 'none']
+      - name: exposure_weight
+        description: Multiplier applied to the hazard score, between 0.0 and 1.0.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: rationale
+        description: Why this category sits in this band. Documentation, not used in logic.

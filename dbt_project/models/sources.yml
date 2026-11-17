@@ -23,3 +23,53 @@ sources:
             description: When the task was assigned. Missing for unassigned tasks.
           - name: scheduled_at
             description: When the work is scheduled to happen. Present on assigned tasks.
+
+      - name: raw_weather_forecast
+        description: >
+          Hourly weather forecasts from Open-Meteo, written by the
+          raw_weather_forecast Dagster asset.
+
+          Append-only: one row per location per forecast hour per fetch, so
+          every forecast the pipeline has ever seen is retained. That history is
+          what lets Product compare a task's risk between runs. Downstream, read
+          stg_weather_forecast instead, which resolves each location-hour to its
+          most recent fetch.
+
+          Declaring this as a source is also what wires the Dagster graph: the
+          custom translator in weather_risk/assets/dbt.py maps it to the asset
+          key of the Python asset that produces it, so dbt cannot build before
+          the forecasts have been fetched.
+        columns:
+          - name: location_id
+            description: FK to raw_locations.
+          - name: latitude
+            description: >
+              Latitude Open-Meteo actually served, which is the nearest model
+              grid cell rather than the coordinate requested. Kept because it
+              explains why two nearby cities can share a forecast.
+          - name: longitude
+            description: Longitude of the served grid cell.
+          - name: timezone_requested
+            description: >
+              Always 'UTC'. Recorded so forecast_time_utc is unambiguous
+              without having to read the ingestion code.
+          - name: forecast_time_utc
+            description: The forecast hour, as a naive timestamp holding UTC wall clock.
+          - name: temperature_2m_c
+            description: Air temperature 2m above ground, celsius.
+          - name: precipitation_mm
+            description: Total precipitation for that hour, millimetres.
+          - name: precipitation_probability
+            description: Probability of precipitation for that hour, percent.
+          - name: wind_speed_kmh
+            description: Mean wind speed 10m above ground, km/h.
+          - name: wind_gusts_kmh
+            description: Maximum wind gust 10m above ground, km/h.
+          - name: weather_code
+            description: WMO weather interpretation code.
+          - name: fetched_at_utc
+            description: >
+              When this fetch ran. Part of the natural key, and the column
+              stg_weather_forecast orders by to find the current forecast.
+          - name: dagster_run_id
+            description: The Dagster run that produced the row, for tracing back to logs.

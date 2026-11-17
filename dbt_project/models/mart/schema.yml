@@ -1,6 +1,291 @@
 version: 2
 
-models: []
+models:
+  - name: fct_task_weather_risk
+    description: >
+      Product's mart. One row per task with upcoming scheduled work, carrying
+      the weather risk score, the label, and enough of the underlying forecast
+      to explain the verdict to a poster.
 
-unit_tests:
-  []
+      A thin pass-through over int_task_weather_risk by design. If this model
+      recomputed the label, it could drift from Operations' daily counts, which
+      the brief says must never happen.
+    columns:
+      - name: task_id
+        description: Grain of the table. One row per task.
+        data_tests:
+          - unique
+          - not_null
+
+      - name: title
+        description: Task title, for the CRM message.
+
+      - name: category
+        description: Canonical category display name.
+        data_tests:
+          - not_null
+
+      - name: city
+        description: >
+          City the task is in. NULL for a task whose location_id is not in the
+          location seed.
+
+      - name: country
+        description: ISO 3166-1 alpha-2.
+
+      - name: scheduled_at_local
+        description: >
+          When the work starts, in the location's own timezone - which is what
+          a warning to the poster should quote, not UTC.
+
+      - name: scheduled_local_date
+        description: >
+          Local calendar day the work falls on. The key Operations' mart joins
+          on, so the two marts agree about which day a task belongs to.
+
+      - name: weather_risk_score
+        description: >
+          0-100. NULL when no usable forecast covered the scheduled window.
+        data_tests:
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+
+      - name: weather_risk_label
+        description: low, medium, high, or unknown when the score is NULL.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['low', 'medium', 'high', 'unknown']
+
+      - name: precip_probability_max
+        description: Highest hourly chance of rain across the working window, percent.
+
+      - name: precip_mm_sum
+        description: Total rain across the working window, millimetres.
+
+      - name: wind_gusts_kmh_max
+        description: Strongest gust across the working window, km/h.
+
+      - name: temperature_min_c
+        description: Coldest hour of the working window, celsius.
+
+      - name: temperature_max_c
+        description: Warmest hour of the working window, celsius.
+
+      - name: weather_code_modal
+        description: Most frequent WMO weather code across the window.
+
+      - name: precip_score
+        description: Precipitation sub-score, 0-100, for explaining the verdict.
+
+      - name: wind_score
+        description: Wind sub-score, 0-100.
+
+      - name: temp_score
+        description: Temperature sub-score, 0-100.
+
+      - name: hazard_score
+        description: Worst of the three sub-scores, before category exposure is applied.
+
+      - name: exposure_class
+        description: Which exposure band the category sits in.
+
+      - name: exposure_weight
+        description: Multiplier applied to hazard_score to get weather_risk_score.
+
+      - name: has_forecast
+        description: >
+          False when no forecast window matched - an orphaned location, refused
+          coordinates, or a task scheduled past the usable horizon. Every such
+          row is labelled 'unknown'.
+        data_tests:
+          - not_null
+
+      - name: forecast_hours_covered
+        description: Forecast hours available in the working window, out of risk_window_hours.
+
+      - name: forecast_fetched_at_utc
+        description: >
+          When the forecast behind this score was fetched. Lets Product tell a
+          stale warning from a fresh one.
+
+      - name: is_valid_coordinates
+        description: False where the location's coordinates were refused by ingestion.
+
+      - name: location_id
+        description: FK to stg_locations. Present even when the location is missing from the seed.
+
+      - name: timezone_name
+        description: IANA timezone used for the local conversion.
+
+      - name: budget
+        description: Task budget.
+
+      - name: posted_at_utc
+        description: When the task was posted, UTC.
+
+      - name: assigned_at_utc
+        description: When the task was assigned, UTC.
+
+      - name: scheduled_at_utc
+        description: When the work starts, UTC.
+
+      - name: scheduled_hour_utc
+        description: Scheduled start truncated to the hour; the forecast join key.
+
+  - name: fct_location_daily_weather
+    description: >
+      Operations' mart. One row per location per local day, with how many tasks
+      are scheduled, how many are high risk, and a summary of that day's
+      weather - days cut at midnight in the location's own timezone.
+
+      Covers the whole forecast horizon rather than only days with tasks, so
+      Operations reads a continuous calendar with zeroes on quiet days instead
+      of gaps they have to interpret.
+
+      Every count is a count of int_task_weather_risk rows, the same model
+      Product's mart passes through. Nothing is rescored and no threshold is
+      re-expressed here, which is what makes the two marts agree by
+      construction. Asserted by tests/assert_marts_agree_on_daily_counts.sql.
+    columns:
+      - name: location_id
+        description: FK to stg_locations.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+
+      - name: local_date
+        description: The day, cut at midnight in this location's timezone.
+        data_tests:
+          - not_null
+
+      - name: city
+        description: City name.
+        data_tests:
+          - not_null
+
+      - name: country
+        description: ISO 3166-1 alpha-2.
+
+      - name: timezone_name
+        description: IANA timezone the day boundaries were cut on.
+        data_tests:
+          - not_null
+
+      - name: scheduled_task_count
+        description: >
+          Tasks with upcoming scheduled work on this local day. Zero on quiet
+          days. Equals the row count in fct_task_weather_risk for the same
+          location and local date.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 1000000
+
+      - name: high_risk_task_count
+        description: >
+          The number both teams must agree on. Equals the count of
+          weather_risk_label = 'high' rows in fct_task_weather_risk for the
+          same location and local date.
+        data_tests:
+          - not_null
+
+      - name: medium_risk_task_count
+        description: Tasks labelled medium on this local day.
+        data_tests:
+          - not_null
+
+      - name: low_risk_task_count
+        description: Tasks labelled low on this local day.
+        data_tests:
+          - not_null
+
+      - name: unknown_risk_task_count
+        description: >
+          Tasks the pipeline cannot score - refused coordinates, or a day past
+          the usable horizon. Reported rather than folded into low, so a data
+          gap is never presented as a safe day and the four counts always sum
+          to scheduled_task_count.
+        data_tests:
+          - not_null
+
+      - name: max_weather_risk_score
+        description: Worst score among that day's tasks. NULL on days with no tasks.
+
+      - name: avg_weather_risk_score
+        description: Mean score among that day's scorable tasks.
+
+      - name: weather_description
+        description: >
+          That day's typical weather in words, from the modal WMO code. NULL
+          where there is no forecast for the location.
+
+      - name: weather_description_worst
+        description: >
+          The worst condition the day reaches, in words. Published alongside
+          the typical reading because the mode alone describes a 5.7mm Seattle
+          day as "Clear sky" - the clear hours hold the plurality while the
+          rain is spread across several codes.
+
+      - name: weather_code_modal
+        description: Most frequent WMO code across the local day.
+
+      - name: weather_code_worst
+        description: Highest WMO code across the local day, as a severity proxy.
+
+      - name: precip_probability_max
+        description: Highest hourly chance of precipitation during the local day, percent.
+
+      - name: precip_mm_total
+        description: Total precipitation across the local day, millimetres.
+
+      - name: wind_gusts_kmh_max
+        description: Strongest gust during the local day, km/h.
+
+      - name: wind_speed_kmh_max
+        description: Highest mean wind speed during the local day, km/h.
+
+      - name: temperature_min_c
+        description: Coldest hour of the local day, celsius.
+
+      - name: temperature_max_c
+        description: Warmest hour of the local day, celsius.
+
+      - name: forecast_hours
+        description: >
+          Hours of forecast behind this day's summary, 0 to 24. Zero means the
+          location has no forecast at all.
+        data_tests:
+          - not_null
+
+      - name: is_complete_local_day
+        description: >
+          False on the partial first and last day of the horizon, and on any
+          day with no weather. Stops a half-observed day reading as a mild one.
+        data_tests:
+          - not_null
+
+      - name: is_valid_coordinates
+        description: False where ingestion refused the location's coordinates.
+
+      - name: forecast_fetched_at_utc
+        description: >
+          Most recent fetch behind this day's weather, so Operations can see
+          how stale a summary is.
+
+    data_tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns:
+              - location_id
+              - local_date
+
+unit_tests: []

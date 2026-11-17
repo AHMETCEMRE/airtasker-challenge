@@ -1,0 +1,14 @@
+category_key,category,exposure_class,exposure_weight,rationale
+roof cleaning,Roof Cleaning,fully_exposed,1.0,Outdoors at height; a wet roof is a fall risk and wind makes it worse
+exterior painting,Exterior Painting,fully_exposed,1.0,Paint will not cure in rain and will not adhere to a wet surface
+lawn mowing,Lawn Mowing,fully_exposed,1.0,Wet grass tears rather than cuts and clogs the mower
+gardening,Gardening,fully_exposed,1.0,Outdoors by definition; saturated soil makes most garden work pointless
+pool cleaning,Pool Cleaning,fully_exposed,1.0,Chemical balancing is undone by rain and the work is entirely outdoors
+moving & removals,Moving & Removals,mixed,0.6,Loading and unloading happen outdoors and goods get wet
+event setup,Event Setup,mixed,0.6,Often outdoors; marquees and gazebos are wind-limited before they are rain-limited
+photography,Photography,mixed,0.6,Outdoor shoots are common but many can move indoors
+cleaning,Cleaning,incidental,0.2,Indoor work; weather affects access parking and carrying equipment
+tax return,Tax Return,none,0.0,Desk or remote work with no weather exposure
+bookkeeping,Bookkeeping,none,0.0,Desk or remote work with no weather exposure
+online tutoring,Online Tutoring,none,0.0,Delivered online
+graphic design,Graphic Design,none,0.0,Desk or remote work with no weather exposure
