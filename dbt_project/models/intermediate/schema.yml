@@ -196,4 +196,72 @@ models:
         data_tests:
           - not_null
 
+  - name: int_location_days
+    description: >
+      One row per location per local day: the calendar spine Operations' mart
+      is built on, with each day's weather aggregated between local midnights.
+
+      The spine comes from stg_locations rather than from the forecast table.
+      Perth has no forecast rows at all, so a weather-derived spine would drop
+      it entirely and hide the 7 scheduled tasks nobody can forecast - exactly
+      the rows Operations most needs to see.
+    columns:
+      - name: location_id
+        description: FK to stg_locations. Every location appears, with or without weather.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+
+      - name: local_date
+        description: Calendar day in the location's own timezone.
+        data_tests:
+          - not_null
+
+      - name: forecast_hours
+        description: >
+          Forecast hours available for this local day, 0 to 24. Zero means no
+          weather at all (Perth). The first and last local day of the horizon
+          are legitimately partial, because a 16-day UTC window does not start
+          or end at local midnight.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: 0
+                max_value: 24
+
+      - name: is_complete_local_day
+        description: >
+          True only for days with all 24 hours. Lets a consumer tell a mild day
+          from a half-observed one.
+        data_tests:
+          - not_null
+
+      - name: weather_description
+        description: >
+          The day's typical weather, from the modal WMO code. NULL where there
+          is no forecast.
+
+      - name: weather_description_worst
+        description: >
+          The worst condition the day reaches, from the maximum WMO code. Kept
+          alongside the modal one because the mode alone understates a day with
+          scattered rain among a plurality of clear hours.
+
+      - name: temperature_min_c
+        description: Coldest hour of the local day, celsius.
+
+      - name: temperature_max_c
+        description: Warmest hour of the local day, celsius.
+
+    data_tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns:
+              - location_id
+              - local_date
+
 unit_tests: []
