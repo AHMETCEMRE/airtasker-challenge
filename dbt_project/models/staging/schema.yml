@@ -3,37 +3,194 @@ version: 2
 models:
   - name: stg_tasks
     description: >
-      Staging model for tasks. Should deduplicate on task_id and cast/rename
-      columns as needed. See README for known data quality issues.
+      One row per task_id. Parses the text columns, normalises the dirty ones
+      and deduplicates. No business rules: which tasks count as having upcoming
+      scheduled work is decided in int_tasks_upcoming.
     columns:
       - name: task_id
-        description: Unique task identifier.
+        description: >
+          Unique task identifier. The source contains three duplicated ids
+          (T003, T017, T041) from a replication glitch; the most recent record
+          by parsed posted_at wins.
+        data_tests:
+          - unique
+          - not_null
+
       - name: title
-      - name: category
+        description: Task title, trimmed. NULL if the source wrote it empty.
+
+      - name: category_key
+        description: >
+          Lowercased, trimmed category - the join key against
+          category_weather_exposure. ~12% of raw values are mis-cased or
+          carry a trailing space.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('category_weather_exposure')
+                field: category_key
+
       - name: location_id
-        description: FK to stg_locations. May reference locations that don't exist.
-      - name: posted_at
-        description: UTC timestamp of when the task was posted.
+        description: >
+          FK to stg_locations. Two tasks reference locations that do not exist
+          (LOC_MISSING_1, LOC_MISSING_2), so this is warn-only: the orphans must
+          stay visible without blocking warnings for every valid location.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+              config:
+                severity: warn
+
       - name: state
+        description: Lowercased task state. ~10% of raw values are capitalised.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['open', 'assigned', 'completed', 'cancelled']
+
       - name: budget
-      - name: assigned_at
-        description: UTC timestamp of when the task was assigned. NULL for unassigned tasks.
-      - name: scheduled_at
-        description: UTC timestamp of when the work is scheduled. Present on assigned tasks only.
+        description: Budget as a number. Raw values arrive as '$284.50', '284.50' or '285'.
+
+      - name: posted_at_utc
+        description: >
+          When the task was posted, UTC. Parsed from three different text
+          formats; see the parse_utc_timestamp macro. Every task has one, so a
+          NULL here means a format the macro does not recognise.
+        data_tests:
+          - not_null
+
+      - name: assigned_at_utc
+        description: When the task was assigned, UTC. NULL for unassigned tasks.
+
+      - name: scheduled_at_utc
+        description: >
+          When the work is scheduled, UTC. NULL unless the task was assigned.
+          Absence arrives as either NULL or an empty string in the source.
 
   - name: stg_locations
     description: >
-      Staging model for locations (sourced from the raw_locations seed).
+      One row per location_id, from the raw_locations seed. Casts the text
+      columns, normalises country codes and flags implausible coordinates.
     columns:
       - name: location_id
         description: Unique location identifier.
-      - name: city
-      - name: country
-        description: Country code — AU, US, or GB.
-      - name: lat
-      - name: lng
-      - name: timezone
-        description: IANA timezone string.
+        data_tests:
+          - unique
+          - not_null
 
-unit_tests:
-  []
+      - name: city
+        description: City name, trimmed.
+        data_tests:
+          - not_null
+
+      - name: country
+        description: >
+          ISO 3166-1 alpha-2. The seed uses 'UK' for Leeds and Glasgow and 'GB'
+          for the other British cities; both normalise to GB.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['AU', 'US', 'GB']
+
+      - name: latitude
+        description: Latitude in degrees. Perth's is transposed with its longitude in the seed.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: -90
+                max_value: 90
+              config:
+                warn_if: ">0"
+                error_if: ">1"
+
+      - name: longitude
+        description: Longitude in degrees.
+        data_tests:
+          - not_null
+          - value_in_range:
+              arguments:
+                min_value: -180
+                max_value: 180
+
+      - name: timezone_name
+        description: >
+          IANA timezone name, used for every UTC-to-local conversion downstream.
+          Required: without it a task cannot be placed on a local day.
+        data_tests:
+          - not_null
+
+      - name: is_valid_coordinates
+        description: >
+          False where the coordinate pair cannot be real, which is Perth only.
+          Warn rather than error on purpose: erroring would fail the whole build
+          over one bad row and deny Product its warnings for the other nineteen
+          cities. error_if '>1' turns it into a hard failure if the problem ever
+          spreads beyond the single known case.
+        data_tests:
+          - is_true:
+              config:
+                warn_if: ">0"
+                error_if: ">1"
+
+  - name: stg_weather_forecast
+    description: >
+      One row per location per forecast hour: the current view of the forecast,
+      resolved from the append-only raw table by taking the most recent fetch
+      that covers each hour.
+    columns:
+      - name: location_id
+        description: FK to stg_locations.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_locations')
+                field: location_id
+
+      - name: forecast_time_utc
+        description: The forecast hour, naive UTC.
+        data_tests:
+          - not_null
+
+      - name: temperature_2m_c
+        description: >
+          Air temperature, celsius. NULL in the last day or two of the 16-day
+          horizon, where Open-Meteo's model data runs out.
+
+      - name: precipitation_mm
+        description: Precipitation for the hour, millimetres.
+
+      - name: precipitation_probability
+        description: Probability of precipitation, percent.
+
+      - name: wind_speed_kmh
+        description: Mean wind speed, km/h.
+
+      - name: wind_gusts_kmh
+        description: Maximum gust, km/h. The wind input to the risk score.
+
+      - name: weather_code
+        description: WMO weather interpretation code.
+
+      - name: fetched_at_utc
+        description: Which fetch this row's values came from.
+        data_tests:
+          - not_null
+
+      - name: dagster_run_id
+        description: The Dagster run that produced the row.
+
+    data_tests:
+      - unique_combination:
+          arguments:
+            combination_of_columns:
+              - location_id
+              - forecast_time_utc
+
+unit_tests: []
